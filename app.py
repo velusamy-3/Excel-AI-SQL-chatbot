@@ -1,10 +1,12 @@
 import os
 import re
+import math
 import pandas as pd
 import requests
 import streamlit as st
 from sqlalchemy import create_engine, text
 from datetime import datetime
+from io import StringIO
 
 # ---------- CONFIG ----------
 DB_PATH = "data.db"
@@ -13,7 +15,6 @@ TABLE_NAME = "data_table"
 MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
 MISTRAL_API_URL = "https://api.mistral.ai/v1/chat/completions"
 MODEL_NAME = "mistral-small-latest"
-
 
 # ---------- DB HELPERS ----------
 def get_engine():
@@ -109,13 +110,19 @@ Rules:
 
 
 # ---------- HUMAN ANSWER ----------
-def call_mistral_for_answer(question: str, sql: str, result_df: pd.DataFrame) -> str:
+def call_mistral_for_answer(question: str, sql: str, result_df: pd.DataFrame, use_full_for_answer: bool = False) -> str:
     _check_api_key()
 
     if result_df.empty:
-        return "I checked the data, but there are no rows matching your question."
+        return "I checked the data, but there are **no rows matching your question**."
 
-    preview = result_df.head(10).to_markdown(index=False)
+    # decide what preview to send: either the full small result or a head preview
+    if use_full_for_answer and len(result_df) <= 1000:
+        preview_df = result_df  # send full if reasonable
+    else:
+        preview_df = result_df.head(10)
+
+    preview = preview_df.to_markdown(index=False)
 
     system_prompt = """
 You are a friendly senior business analyst.
@@ -127,7 +134,7 @@ Write in a natural HUMAN tone:
 - Use Markdown **bold** to highlight the main facts (important numbers and key entity names).
 - Do NOT mention SQL terms like COUNT, SELECT, columns, etc.
 - Base answer ONLY on the result preview.
-- 1–3 sentences.
+- 1–4 sentences. If the user asked to show the full dataset, explicitly state that you displayed the full data or provided a download link.
 """
 
     user_content = f"""
@@ -173,15 +180,64 @@ def run_sql(sql: str) -> pd.DataFrame:
         return pd.read_sql(text(sql), conn)
 
 
+# ---------- Helpers for "show all" behavior ----------
+def is_display_all_intent(question: str, sql: str) -> bool:
+    """
+    Detects if user intent is to display the full dataset.
+    Checks both natural language cues and whether SQL is a bare SELECT * FROM table.
+    """
+    q = question.lower()
+    display_triggers = [
+        "show all", "display all", "display the whole", "show the whole",
+        "full dataset", "all the data", "every row", "give me the data",
+        "show entire", "show me everything", "list all", "dump all"
+    ]
+    if any(trigger in q for trigger in display_triggers):
+        return True
+
+    # simple check: SELECT * FROM TABLE_NAME (optionally with double quotes)
+    normalized_sql = sql.lower().replace('"', "").replace("'", "").strip()
+    if re.match(rf"^select\s+\*\s+from\s+{re.escape(TABLE_NAME.lower())}\s*$", normalized_sql):
+        return True
+
+    return False
+
+
+def dataframe_summary(df: pd.DataFrame, top_n_vals: int = 5) -> str:
+    rows, cols = df.shape
+    summary_lines = [f"**Rows:** **{rows}**  •  **Columns:** **{cols}**"]
+    # numeric stats (brief)
+    num_df = df.select_dtypes(include=["number"])
+    if not num_df.empty:
+        desc = num_df.describe().T
+        # take first 3 numeric columns to summarize (avoid long output)
+        for i, (col, row) in enumerate(desc.iterrows()):
+            if i >= 3:
+                break
+            summary_lines.append(f"**{col}** — mean: {round(row['mean'], 2)}, std: {round(row['std'],2)}")
+    # top values for up to 3 text cols
+    text_cols = df.select_dtypes(include=["object"]).columns.tolist()[:3]
+    for col in text_cols:
+        top_vals = df[col].dropna().astype(str).value_counts().head(top_n_vals)
+        if not top_vals.empty:
+            vals = "; ".join([f"{v} ({c})" for v, c in zip(top_vals.index.tolist(), top_vals.values.tolist())])
+            summary_lines.append(f"**{col}** top: {vals}")
+    return "  \n".join(summary_lines)
+
+
+def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
+    return df.to_csv(index=False).encode("utf-8")
+
+
 # ---------- STREAMLIT APP ----------
 def main():
+    st.set_page_config(page_title="Excel → AI SQL Chatbot", layout="wide")
     st.title("📊 Excel → AI SQL Chatbot")
 
     # persistent flags
     if "data_loaded" not in st.session_state:
         st.session_state["data_loaded"] = existing_data_available()
     if "chat_history" not in st.session_state:
-        # now we store items as {"q": "...", "a": "...", "sql": "...", "ts": "YYYY-MM-DD HH:MM:SS"}
         st.session_state["chat_history"] = []
 
     # upload section
@@ -220,6 +276,8 @@ def main():
                 if sql == "NO_ANSWER":
                     answer = "This question requires information that is not available in the uploaded data."
                     displayed_sql = None
+                    result_df = pd.DataFrame()
+                    show_full_intent = False
                 else:
                     displayed_sql = sql  # store for UI / history
 
@@ -229,15 +287,76 @@ def main():
                         # safety summary
                         if not is_safe_sql(displayed_sql):
                             st.error("⚠️ The generated SQL was flagged as unsafe and will NOT be executed.")
+                            result_df = pd.DataFrame()
+                            show_full_intent = False
                         else:
                             st.success("SQL looks safe to execute (basic safety checks passed).")
+                            # determine intent to show all
+                            show_full_intent = is_display_all_intent(question, displayed_sql)
+                            result_df = run_sql(displayed_sql)
 
-                    # Only run if safe
-                    if not is_safe_sql(displayed_sql):
-                        answer = "The generated SQL was flagged as unsafe and was not executed."
+                    # Only run if safe (result_df set above)
+                    if result_df is None:
+                        result_df = pd.DataFrame()
+
+                    # If user intended to see all data or to preview, produce a professional display
+                    # Safety: if very large, warn and limit initial render
+                    MAX_RENDER_FULL_ROWS = 20000  # threshold for full immediate render
+                    PREVIEW_ROWS = 200
+
+                    if show_full_intent:
+                        # create summary
+                        summary_text = dataframe_summary(result_df)
+                        st.markdown("### 📋 Dataset Summary")
+                        st.markdown(summary_text)
+
+                        # offer download always
+                        csv_bytes = df_to_csv_bytes(result_df)
+                        st.download_button(
+                            "⬇️ Download full result as CSV",
+                            data=csv_bytes,
+                            file_name="query_result.csv",
+                            mime="text/csv",
+                        )
+
+                        # If result is huge, warn and show preview + explicit button to render full
+                        total_rows = len(result_df)
+                        if total_rows > MAX_RENDER_FULL_ROWS:
+                            st.warning(
+                                f"The result contains **{total_rows:,}** rows. "
+                                "Rendering all rows in the browser may be slow. "
+                                "You can download the full CSV above, or render a preview below."
+                            )
+                            st.dataframe(result_df.head(PREVIEW_ROWS))
+                            if st.button("Show full table anyway (may be slow)"):
+                                st.dataframe(result_df)
+                        else:
+                            # safe to display full result immediately if small/moderate
+                            # but still put inside an expander so UI stays tidy
+                            with st.expander(f"Show full table ({total_rows} rows)"):
+                                st.dataframe(result_df)
+
+                        # generate the AI answer using full data if it's not too large
+                        use_full_for_answer = total_rows <= 1000  # cap for LLM preview
+                        answer = call_mistral_for_answer(question, displayed_sql, result_df, use_full_for_answer)
+
                     else:
-                        result_df = run_sql(displayed_sql)
-                        answer = call_mistral_for_answer(question, displayed_sql, result_df)
+                        # normal behavior: show a concise preview and let user expand
+                        if result_df.empty:
+                            answer = "I checked the data, but there are no rows matching your question."
+                        else:
+                            st.markdown("### 🔢 Query Result Preview")
+                            st.dataframe(result_df.head(10))
+                            # offer download of the result
+                            csv_bytes = df_to_csv_bytes(result_df)
+                            st.download_button(
+                                "⬇️ Download query result as CSV",
+                                data=csv_bytes,
+                                file_name="query_result.csv",
+                                mime="text/csv",
+                            )
+
+                            answer = call_mistral_for_answer(question, displayed_sql, result_df, use_full_for_answer=False)
 
                 # append with timestamp (formatted) and SQL
                 ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
