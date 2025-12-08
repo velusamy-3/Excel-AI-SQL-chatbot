@@ -25,6 +25,11 @@ def get_engine():
 def load_excel_to_db(file) -> pd.DataFrame:
     filename: str = file.name
     df = pd.read_csv(file) if filename.lower().endswith(".csv") else pd.read_excel(file)
+
+    # 🔹 Try to convert numeric-looking columns to real numbers
+    for col in df.columns:
+        df[col] = pd.to_numeric(df[col], errors="ignore")
+
     engine = get_engine()
     df.to_sql(TABLE_NAME, engine, if_exists="replace", index=False)
     return df
@@ -105,15 +110,68 @@ You are an SQL expert for a single SQLite table.
 TABLE NAME: {TABLE_NAME}
 SCHEMA + EXAMPLE VALUES: {rich_schema}
 
-Rules:
-- Use ONLY the table data in {TABLE_NAME}.
-- NEVER query PRAGMA_TABLE_INFO, pragma_table_info, or any other PRAGMA.
-- NEVER query INFORMATION_SCHEMA or any system/metadata tables.
-- Do NOT try to inspect the schema using SQL; rely ONLY on the schema description I gave you.
-- Handle spelling mistakes, underscores, spaces, and hyphens in IDs and names using LOWER() + REPLACE().
-- Generate ONE valid SELECT query on {TABLE_NAME}.
-- No semicolons, no DDL/DML.
-- Return ONLY SQL or NO_ANSWER.
+Your job: turn the user's natural-language question into exactly ONE valid
+SELECT query on {TABLE_NAME}.
+
+Very important rules:
+
+1) Table & columns
+- Use ONLY the table {TABLE_NAME}.
+- Use ONLY the columns that appear in the schema description above.
+- When the user mentions a field like "stock quantity", "qty in stock",
+  "available qty", etc., map it to the CLOSEST column name in the schema.
+- Treat spaces, underscores, hyphens, and case as irrelevant when matching
+  names. (Example: "stock_quantity", "Stock Quantity", "stock-quantity"
+  should all be treated as the same concept.)
+
+2) Comparison / filter questions  (THIS IS CRITICAL)
+- If the user asks things like:
+    - "greater than 500", "more than 500", "over 500", "above 500"
+      → use the operator ">".
+    - "greater than or equal to 500", "at least 500", "no less than 500"
+      → use ">=".
+    - "less than 500", "under 500", "below 500"
+      → use "<".
+    - "less than or equal to 500", "at most 500", "no more than 500"
+      → use "<=".
+    - "between 100 and 200"
+      → use "BETWEEN 100 AND 200" (inclusive).
+
+- ALWAYS extract the numeric threshold(s) from the question and use them
+  literally in the WHERE clause.
+
+- If the target column is text in the schema (because the CSV had strings),
+  still perform the numeric comparison by casting to REAL. For example:
+
+    CAST("stock quantity" AS REAL) > 500
+
+  or
+
+    CAST("price" AS REAL) BETWEEN 100 AND 200
+
+3) General SQL constraints
+- Generate exactly ONE valid SELECT query on {TABLE_NAME}.
+- No semicolons.
+- No PRAGMA, no INFORMATION_SCHEMA, no system/metadata tables.
+- Do NOT try to inspect the schema using SQL; rely ONLY on the description.
+- No DDL or DML: do NOT use CREATE, DROP, INSERT, UPDATE, DELETE, ALTER, etc.
+- Do not alias the table or join with anything else.
+
+4) Output format
+- Return ONLY the raw SQL text, with no explanation.
+- If and only if the question truly cannot be answered from this single
+  table (for example, it clearly needs another system or external data),
+  then return exactly: NO_ANSWER
+
+Example-style mapping (these are just examples, do not echo them back):
+
+User: "List all products where stock quantity is greater than 500"
+SQL:  SELECT * FROM {TABLE_NAME}
+      WHERE CAST("stock quantity" AS REAL) > 500
+
+User: "Show customers with total amount less than 1000"
+SQL:  SELECT * FROM {TABLE_NAME}
+      WHERE CAST("total amount" AS REAL) < 1000
 """
 
     payload = {
@@ -193,26 +251,46 @@ Data Preview:
 
 
 # ---------- SQL SAFETY ----------
-FORBIDDEN = [
-    r";",
-    r"DROP",
-    r"DELETE",
-    r"UPDATE",
-    r"INSERT",
-    r"ALTER",
-    r"CREATE",
-    r"PRAGMA",
-    r"PRAGMA_TABLE_INFO",
-    r"INFORMATION_SCHEMA",
-]
-
 
 def is_safe_sql(sql: str) -> bool:
-    if not sql.lower().startswith("select"):
+    """Stricter SQL safety for real-company use."""
+    if not isinstance(sql, str):
         return False
-    for p in FORBIDDEN:
-        if re.search(p, sql, re.IGNORECASE):
+
+    s = sql.strip()
+    s_lower = s.lower()
+
+    # Must be a SELECT
+    if not s_lower.startswith("select"):
+        return False
+
+    # Must query ONLY our table (no other FROM targets)
+    from_pattern = rf"\bfrom\s+{re.escape(TABLE_NAME.lower())}\b"
+    if re.search(from_pattern, s_lower) is None:
+        return False
+
+    # Forbid dangerous patterns / keywords
+    forbidden_patterns = [
+        r";",                  # no multiple statements
+        r"\bunion\b",
+        r"\bjoin\b",
+        r"\bwith\b",
+        r"\battach\b",
+        r"\bsqlite_master\b",
+        r"\binformation_schema\b",
+        r"\bpragma\b",
+        r"\bupdate\b",
+        r"\bdelete\b",
+        r"\binsert\b",
+        r"\bdrop\b",
+        r"\balter\b",
+        r"\bcreate\b",
+    ]
+
+    for pat in forbidden_patterns:
+        if re.search(pat, s_lower, re.IGNORECASE):
             return False
+
     return True
 
 
@@ -289,8 +367,8 @@ def handle_exact_lookup(question: str):
     if not q:
         return None
 
-    # capture ALL IDs: e.g. ["PO-00034", "PO-00037"]
-    id_pattern = re.compile(r"\b[A-Za-z]{2,15}[-_\s]?\d{1,10}\b")
+    # No spaces allowed → avoids matching phrases like "than 500"
+    id_pattern = re.compile(r"\b[A-Za-z]{2,15}[-_]?\d{1,10}\b")
     id_matches = id_pattern.findall(q)
     if not id_matches:
         return None
@@ -341,7 +419,7 @@ def build_answer_for_single_row(question: str, result_df: pd.DataFrame) -> str:
     q_norm = question.lower()
 
     # detect ID
-    id_pattern = re.compile(r"\b[A-Za-z]{2,15}[-_\s]?\d{1,10}\b")
+    id_pattern = re.compile(r"\b[A-Za-z]{2,15}[-_]?\d{1,10}\b")
     id_match = id_pattern.search(question)
     id_val = id_match.group(0) if id_match else None
 
@@ -474,7 +552,10 @@ def main():
 
     # -------- Main layout: query, answer, history --------
     st.markdown("### 🔍 Ask a question")
-    st.write("Examples: `Show all data`, `how many records are there`")
+    st.write(
+        "Examples: `Show all data`, `how many records are there`, "
+        "`List all products where stock quantity is greater than 500`"
+    )
 
     with st.form(key="ask_form"):
         question = st.text_input("Type your question here:")
