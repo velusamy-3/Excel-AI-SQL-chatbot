@@ -554,7 +554,7 @@ def main():
     st.markdown("### 🔍 Ask a question")
     st.write(
         "Examples: `Show all data`, `how many records are there`, "
-        "`List all products where stock quantity is greater than 500`"
+        "`Use (List all) for get all filtered data `"
     )
 
     with st.form(key="ask_form"):
